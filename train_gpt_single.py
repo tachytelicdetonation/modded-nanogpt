@@ -3,8 +3,10 @@ import sys
 
 with open(sys.argv[0]) as f:
     code = f.read()  # read the code of this file ASAP, for logging
+import argparse
 import copy
 import glob
+import json
 import math
 import threading
 import time
@@ -763,6 +765,159 @@ class CausalSelfAttention(nn.Module):
         y = F.linear(y, self.qkvo_w.view(4, self.hdim, self.dim)[3].type_as(y))
         return y
 
+class DifferentialAttention(nn.Module):
+    """
+    Differential Transformer Attention Mechanism
+    Paper: https://arxiv.org/abs/2410.05258
+
+    Key innovation: Computes attention as the difference between two separate softmax attention maps,
+    which cancels noise and promotes sparse attention patterns.
+
+    A_diff = softmax(Q1·K1^T / sqrt(d)) - λ·softmax(Q2·K2^T / sqrt(d))
+
+    Preserves existing modded-nanogpt features:
+    - QK Normalization for training stability
+    - Sparse Gating for context-aware masking
+    - Token Value Embeddings
+    - RoPE with YaRN positional encoding
+    """
+    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, lambda_init_base: float = 0.8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.dim = dim
+        self.hdim = num_heads * head_dim
+        self.layer_idx = layer_idx
+
+        assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
+        assert num_heads >= 8, f"Differential attention requires at least 8 heads, got {num_heads}"
+
+        # Differential attention uses split Q/K: each attention map gets head_dim/2 dimensions
+        # Value vectors use full head_dim dimensions (2x for recombination)
+        self.qk_head_dim = head_dim // 2
+
+        # Layer-dependent lambda initialization (formula from paper)
+        # λ_init = 0.8 - 0.6 * exp(-0.3 * (layer_idx - 1))
+        self.lambda_init = lambda_init_base - 0.6 * torch.exp(torch.tensor(-0.3 * max(0, layer_idx - 1)))
+
+        # Weight initialization
+        # Q1, K1, Q2, K2 each get head_dim/2 dimensions
+        # V gets full head_dim dimensions
+        # Total QK dim: 4 * (head_dim/2) * num_heads = 2 * hdim
+        # V dim: head_dim * num_heads = hdim
+        std = 0.5 * (self.dim ** -0.5)
+        bound = (3 ** 0.5) * std
+
+        # Separate projections for two attention maps
+        # Q1, K1, Q2, K2: shape [hdim, dim*2] to get 2*hdim output (split across 4 projections)
+        # V, O: shape [hdim, dim] for standard dimensions
+        self.qk12_w = nn.Parameter(torch.empty(self.hdim, self.dim * 2))  # For Q1,K1,Q2,K2
+        self.v_w = nn.Parameter(torch.empty(self.hdim, self.dim))         # For V
+        self.o_w = nn.Parameter(torch.empty(self.hdim, self.dim))         # For O
+
+        # Label for custom optimizer sizing
+        self.qk12_w.label = 'attn'
+        self.v_w.label = 'attn'
+        self.o_w.label = 'attn'
+
+        with torch.no_grad():
+            self.qk12_w.uniform_(-bound, bound)  # Q1, K1, Q2, K2
+            self.v_w.uniform_(-bound, bound)     # V
+            self.o_w.zero_()                     # Output projection (zero init)
+
+        # Lambda parameters (learnable scalars per head)
+        # Using reparameterization: λ = exp(λ_q1·λ_k1) - exp(λ_q2·λ_k2) + λ_init
+        self.lambda_q1_k1 = nn.Parameter(torch.zeros(num_heads))
+        self.lambda_q2_k2 = nn.Parameter(torch.zeros(num_heads))
+        self.lambda_q1_k1.label = 'lambda'
+        self.lambda_q2_k2.label = 'lambda'
+
+        # Per-head normalization (using GroupNorm with num_heads groups)
+        # Each head is normalized independently
+        self.head_norm = nn.GroupNorm(num_groups=num_heads, num_channels=self.hdim, affine=True, eps=1e-5)
+
+        # Sparse gated attention (same as CausalSelfAttention)
+        self.attn_gate = CastedLinear(12, num_heads)
+        self.attn_gate.weight.label = 'attn_gate'
+        self.attn_gate.weight.detach().zero_()
+
+    def forward(self, x: Tensor, attn_args: AttnArgs):
+        B, T = x.size(0), x.size(1)
+        assert B == 1, "varlen sequences requires B == 1"
+        assert T % 16 == 0
+
+        # Unpack attention args
+        cos, sin = attn_args.cos, attn_args.sin
+        ve, sa_lambdas = attn_args.ve, attn_args.sa_lambdas
+        seqlens, attn_scale, bm_size = attn_args.seqlens, attn_args.attn_scale, attn_args.bm_size
+
+        # Project to Q1, K1, Q2, K2 (split queries and keys)
+        # Shape: (B, T, 4 * num_heads, qk_head_dim)
+        qk = F.linear(x, self.qk12_w.type_as(x)).view(B, T, 4 * self.num_heads, self.qk_head_dim)
+        q1, k1, q2, k2 = qk.chunk(4, dim=-2)
+
+        # Project to V (standard value dimension)
+        # Shape: (B, T, num_heads, head_dim)
+        v = F.linear(x, self.v_w.type_as(x)).view(B, T, self.num_heads, self.head_dim)
+
+        # QK Normalization (preserve existing feature @Grad62304977)
+        q1, k1 = norm(q1), norm(k1)
+        q2, k2 = norm(q2), norm(k2)
+
+        # Apply RoPE to both Q/K pairs (preserve existing feature)
+        q1, k1 = rotary(q1, cos, sin), rotary(k1, cos, sin)
+        q2, k2 = rotary(q2, cos, sin), rotary(k2, cos, sin)
+
+        # Token Value Embeddings (preserve existing feature @KoszarskyB)
+        if ve is not None:
+            v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view_as(v)
+        else:
+            v = sa_lambdas[0] * v
+
+        max_len = args.train_max_seq_len if self.training else (args.val_batch_size // grad_accum_steps)
+
+        # Compute two separate attention maps using FlashAttention 3
+        # A1 = softmax(Q1·K1^T / sqrt(d))·V
+        y1 = flash_attn_interface.flash_attn_varlen_func(
+            q1[0], k1[0], v[0],
+            cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+            max_seqlen_q=max_len, max_seqlen_k=max_len,
+            causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0)
+        )
+
+        # A2 = softmax(Q2·K2^T / sqrt(d))·V
+        y2 = flash_attn_interface.flash_attn_varlen_func(
+            q2[0], k2[0], v[0],
+            cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+            max_seqlen_q=max_len, max_seqlen_k=max_len,
+            causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0)
+        )
+
+        # Compute lambda with reparameterization
+        # λ = exp(λ_q1_k1) - exp(λ_q2_k2) + λ_init
+        lambda_val = (torch.exp(self.lambda_q1_k1) - torch.exp(self.lambda_q2_k2) + self.lambda_init).view(1, 1, self.num_heads, 1)
+
+        # Differential attention: A_diff = A1 - λ·A2
+        y1 = y1.view(B, T, self.num_heads, self.head_dim)
+        y2 = y2.view(B, T, self.num_heads, self.head_dim)
+        y = y1 - lambda_val * y2
+
+        # Per-head normalization with (1 - λ_init) scaling
+        # Reshape for GroupNorm: (B, T, num_heads, head_dim) -> (B, num_heads * head_dim, T)
+        y = y.view(B, T, self.hdim).transpose(1, 2)
+        y = self.head_norm(y)
+        y = y.transpose(1, 2).view(B, T, self.num_heads, self.head_dim)
+        y = (1 - self.lambda_init) * y
+
+        # Sparse gated attention (preserve existing feature @classiclarryd)
+        y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
+
+        # Output projection
+        y = y.contiguous().view(B, T, self.hdim)
+        y = F.linear(y, self.o_w.type_as(y))
+
+        return y
+
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -878,17 +1033,82 @@ class SpikingMLP(nn.Module):
 
         return x
 
-class Block(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, use_spiking_mlp: bool = False, time_steps: int = 4):
+class SwiGLUMLP(nn.Module):
+    """
+    SwiGLU Feed-Forward Network
+    Used in modern LLMs (LLaMA, PaLM, etc.) and Differential Transformer paper
+
+    SwiGLU(x) = (Swish(xW_gate) ⊙ xW_up) @ W_down
+    where Swish(x) = x * sigmoid(x)
+
+    Uses expansion ratio of 8d/3 to match parameter count with standard 4d MLP:
+    - Standard MLP: 2 matrices of (d × 4d) = 8d² parameters
+    - SwiGLU: 3 matrices totaling 8d² parameters with hidden_dim = 8d/3
+    """
+    def __init__(self, dim: int):
         super().__init__()
-        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx not in [0, 7] else None
-        # skip MLP blocks for first MLP layer by @EmelyanenkoK
-        if layer_idx != 0:
-            if use_spiking_mlp and SPIKING_AVAILABLE:
-                self.mlp = SpikingMLP(dim, time_steps=time_steps)
+        # Expansion ratio: 8/3 to match parameter count with 4x MLP
+        # Round to nearest multiple of 256 for efficiency
+        hdim = int((8 * dim) // 3)
+        hdim = ((hdim + 255) // 256) * 256  # Round to nearest 256
+
+        # Three projection matrices
+        self.w_gate = nn.Parameter(torch.empty(dim, hdim))  # Gate projection
+        self.w_up = nn.Parameter(torch.empty(dim, hdim))    # Up projection
+        self.w_down = nn.Parameter(torch.empty(hdim, dim))  # Down projection
+
+        # Label modules for custom optimizer sizing
+        self.w_gate.label = 'mlp'
+        self.w_up.label = 'mlp'
+        self.w_down.label = 'mlp'
+
+        # Weight initialization
+        std = 0.5 * (dim ** -0.5)
+        bound = (3 ** 0.5) * std
+        with torch.no_grad():
+            self.w_gate.uniform_(-bound, bound)
+            self.w_up.uniform_(-bound, bound)
+            self.w_down.zero_()  # Zero init for down projection
+
+    def forward(self, x: Tensor):
+        # Gate: Swish activation (x * sigmoid(x))
+        gate = F.linear(x, self.w_gate.T.type_as(x))
+        gate = gate * torch.sigmoid(gate)  # Swish(xW_gate)
+
+        # Up: Linear projection
+        up = F.linear(x, self.w_up.T.type_as(x))  # xW_up
+
+        # Element-wise multiplication and down projection
+        x = gate * up  # Swish(xW_gate) ⊙ xW_up
+        x = F.linear(x, self.w_down.T.type_as(x))  # @ W_down
+
+        return x
+
+class Block(nn.Module):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int,
+                 use_diff_attn: bool = False, diff_attn_lambda_init_base: float = 0.8,
+                 mlp_type: str = 'relu2', time_steps: int = 4):
+        super().__init__()
+
+        # Conditional attention: skip attention of blocks.7 (the 8th layer) by @YouJiacheng
+        if layer_idx not in [0, 7]:
+            if use_diff_attn:
+                self.attn = DifferentialAttention(dim, head_dim, num_heads, layer_idx, diff_attn_lambda_init_base)
             else:
+                self.attn = CausalSelfAttention(dim, head_dim, num_heads)
+        else:
+            self.attn = None
+
+        # Conditional MLP: skip MLP blocks for first MLP layer by @EmelyanenkoK
+        if layer_idx != 0:
+            if mlp_type == 'spiking' and SPIKING_AVAILABLE:
+                self.mlp = SpikingMLP(dim, time_steps=time_steps)
+            elif mlp_type == 'swiglu':
+                self.mlp = SwiGLUMLP(dim)
+            elif mlp_type == 'relu2':
                 self.mlp = MLP(dim)
+            else:
+                raise ValueError(f"Unknown mlp_type: {mlp_type}. Choose from 'relu2', 'swiglu', or 'spiking'")
         else:
             self.mlp = None
 
@@ -908,8 +1128,14 @@ def next_multiple_of_n(v: float | int, *, n: int):
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int,
-                 use_spiking_mlp: bool = False, time_steps: int = 4):
+                 use_diff_attn: bool = False, diff_attn_lambda_init_base: float = 0.8,
+                 mlp_type: str = 'relu2', time_steps: int = 4):
         super().__init__()
+
+        # Validate differential attention requirements
+        if use_diff_attn and num_heads < 8:
+            raise ValueError(f"Differential attention requires at least 8 heads, got {num_heads}")
+
         vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.embed = nn.Embedding(vocab_size, model_dim)
         self.smear_gate = CastedLinear(12, 1)
@@ -919,7 +1145,14 @@ class GPT(nn.Module):
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i, use_spiking_mlp=use_spiking_mlp, time_steps=time_steps) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([
+            Block(model_dim, head_dim, num_heads, i,
+                  use_diff_attn=use_diff_attn,
+                  diff_attn_lambda_init_base=diff_attn_lambda_init_base,
+                  mlp_type=mlp_type,
+                  time_steps=time_steps)
+            for i in range(num_layers)
+        ])
         self.yarn = Yarn(head_dim, max_seq_len)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
@@ -1224,8 +1457,71 @@ class Hyperparameters:
     # spiking neural network options
     use_spiking_mlp: bool = False  # Replace standard MLP with Spiking MLP (requires spikingjelly)
     snn_time_steps: int = 4  # Number of time steps for SNN (T=4 training, T=1 inference)
+    # differential transformer options
+    use_diff_attn: bool = False  # Use Differential Attention instead of standard attention
+    diff_attn_lambda_init_base: float = 0.8  # Base lambda initialization for differential attention
+    # MLP activation options
+    mlp_type: str = 'relu2'  # MLP activation type: 'relu2', 'swiglu', or 'spiking'
 
-args = Hyperparameters()
+# Parse command line arguments for config file
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='Train GPT-2 on single H100 GPU')
+    parser.add_argument('--config', type=str, default=None,
+                        help='Path to JSON config file (optional, uses defaults if not provided)')
+    return parser.parse_args()
+
+def load_config(config_path):
+    """Load configuration from JSON file"""
+    with open(config_path, 'r') as f:
+        return json.load(f)
+
+def merge_config_with_hyperparameters(config):
+    """Merge JSON config with Hyperparameters dataclass defaults"""
+    args = Hyperparameters()
+
+    # Merge data section
+    if 'data' in config:
+        for key, value in config['data'].items():
+            if hasattr(args, key):
+                setattr(args, key, value)
+
+    # Merge training section
+    if 'training' in config:
+        for key, value in config['training'].items():
+            if hasattr(args, key):
+                setattr(args, key, value)
+        # Recalculate num_iterations after loading config
+        args.num_iterations = args.num_scheduled_iterations + args.num_extension_iterations
+
+    # Merge logging section
+    if 'logging' in config:
+        for key, value in config['logging'].items():
+            if hasattr(args, key) and value is not None:
+                setattr(args, key, value)
+
+    # Merge attention section
+    if 'attention' in config:
+        for key, value in config['attention'].items():
+            if hasattr(args, key):
+                # Handle tuple conversion for ws_schedule
+                if key == 'ws_schedule' and isinstance(value, list):
+                    setattr(args, key, tuple(value))
+                else:
+                    setattr(args, key, value)
+
+    return args
+
+# Load configuration
+cli_args = parse_args()
+if cli_args.config:
+    print(f"\n{'='*60}")
+    print(f"Loading configuration from: {cli_args.config}")
+    print(f"{'='*60}\n")
+    config = load_config(cli_args.config)
+    args = merge_config_with_hyperparameters(config)
+else:
+    args = Hyperparameters()
 
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
@@ -1341,7 +1637,9 @@ model: nn.Module = GPT(
     head_dim=128,
     model_dim=768,
     max_seq_len=max(args.train_batch_size, args.val_batch_size) // grad_accum_steps,
-    use_spiking_mlp=args.use_spiking_mlp,
+    use_diff_attn=args.use_diff_attn,
+    diff_attn_lambda_init_base=args.diff_attn_lambda_init_base,
+    mlp_type=args.mlp_type,
     time_steps=args.snn_time_steps
 ).cuda()
 for m in model.modules():

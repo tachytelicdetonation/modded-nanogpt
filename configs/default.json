@@ -1,0 +1,28 @@
+{
+  "_comment": "Default configuration for full GPT-2 Small (124M) training on FineWeb",
+  "data": {
+    "train_files": "data/fineweb10B/fineweb_train_*.bin",
+    "val_files": "data/fineweb10B/fineweb_val_*.bin",
+    "val_tokens": 10485760,
+    "train_batch_size": 262144,
+    "train_max_seq_len": 2048,
+    "val_batch_size": 2097152
+  },
+  "training": {
+    "num_scheduled_iterations": 2275,
+    "num_extension_iterations": 40,
+    "cooldown_frac": 0.45,
+    "grad_accum_steps": 8
+  },
+  "logging": {
+    "run_id": null,
+    "val_loss_every": 250,
+    "save_checkpoint": false
+  },
+  "attention": {
+    "block_size": 128,
+    "ws_schedule": [3, 7, 11],
+    "ws_validate": 13,
+    "ws_validate_post_yarn_ext": 20
+  }
+}

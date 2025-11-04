@@ -231,7 +231,7 @@ echo "Expected time: ~10 minutes"
 echo ""
 
 echo "Running baseline training..."
-python train_validation_baseline.py 2>&1 | tee "${BASELINE_LOG}"
+python train_gpt_single.py --config configs/validation_baseline.json 2>&1 | tee "${BASELINE_LOG}"
 
 # Extract final validation loss
 BASELINE_VAL_LOSS=$(grep "val_loss:" "${BASELINE_LOG}" | tail -1 | grep -oP 'val_loss:\s*\K[0-9.]+' || echo "N/A")
@@ -255,7 +255,7 @@ echo "Expected time: ~8 minutes"
 echo ""
 
 echo "Running filtered training..."
-FILTERED_DATA_DIR="${OUTPUT_DIR}" python train_validation_filtered.py 2>&1 | tee "${FILTERED_LOG}"
+python train_gpt_single.py --config configs/validation_filtered.json 2>&1 | tee "${FILTERED_LOG}"
 
 # Extract final validation loss
 FILTERED_VAL_LOSS=$(grep "val_loss:" "${FILTERED_LOG}" | tail -1 | grep -oP 'val_loss:\s*\K[0-9.]+' || echo "N/A")
