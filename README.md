@@ -152,5 +152,3 @@ Same as the original [modded-nanogpt](https://github.com/KellerJordan/modded-nan
 - 🐦 **Follow the speedrun**: [@kellerjordan0 on X](https://x.com/kellerjordan0)
 
 ---
-
-**Remember**: This is a fun experiment, not a competition entry! Go fast, but also have fun! 🎉
