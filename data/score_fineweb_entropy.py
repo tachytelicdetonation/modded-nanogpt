@@ -116,9 +116,9 @@ def compute_nll_score(model: SimpleGPT, document: Tensor, device: torch.device, 
             end = min(start + max_seq_len, doc_len - 1)
             chunk_len = end - start
 
-            # Get input and target
-            input_ids = document[start:end].unsqueeze(0).to(device)  # [1, chunk_len]
-            targets = document[start + 1:end + 1].to(device)  # [chunk_len]
+            # Get input and target (convert uint16 -> int64 for embedding)
+            input_ids = document[start:end].unsqueeze(0).to(device, dtype=torch.long)  # [1, chunk_len]
+            targets = document[start + 1:end + 1].to(device, dtype=torch.long)  # [chunk_len]
 
             # Forward pass
             logits = model(input_ids)  # [1, chunk_len, vocab]
