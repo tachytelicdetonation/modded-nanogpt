@@ -32,7 +32,11 @@ import triton.language as tl
 from kernels import get_kernel
 from torch import Tensor, nn
 
-dynamo.config.recompile_limit = 64
+# Handle both old and new PyTorch versions (recompile_limit was renamed from cache_size_limit)
+try:
+    dynamo.config.recompile_limit = 64
+except AttributeError:
+    dynamo.config.cache_size_limit = 64
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
