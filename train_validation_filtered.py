@@ -8,13 +8,12 @@ for validation on filtered data (80%).
 
 import sys
 import os
+import tempfile
+import subprocess
 
 # Read the main training file
 with open('train_gpt_single.py', 'r') as f:
     code = f.read()
-
-# Find and replace the Hyperparameters section
-# We'll inject our modifications before the class is instantiated
 
 # Get output directory from environment or use default
 FILTERED_DATA_DIR = os.environ.get('FILTERED_DATA_DIR', 'data/fineweb10B_filtered_80pct')
@@ -54,5 +53,16 @@ else:
     print("ERROR: Could not find 'args = Hyperparameters()' in train_gpt_single.py")
     sys.exit(1)
 
-# Execute the modified code
-exec(code)
+# Write to a temporary file in the current directory (needed for Triton JIT)
+temp_file = '.train_filtered_temp.py'
+try:
+    with open(temp_file, 'w') as f:
+        f.write(code)
+
+    # Run the temporary file
+    result = subprocess.run([sys.executable, temp_file], env=os.environ.copy())
+    sys.exit(result.returncode)
+finally:
+    # Cleanup
+    if os.path.exists(temp_file):
+        os.remove(temp_file)
