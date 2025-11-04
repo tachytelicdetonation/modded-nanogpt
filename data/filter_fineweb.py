@@ -65,24 +65,28 @@ def extract_documents(tokens: torch.Tensor) -> List[torch.Tensor]:
     Returns:
         List of document tensors (each starting with BOS)
     """
-    # Find BOS positions
-    bos_positions = (tokens == BOS_ID).nonzero(as_tuple=True)[0].tolist()
+    # Find BOS positions (use numpy for speed)
+    import numpy as np
+    bos_mask = tokens.numpy() == BOS_ID
+    bos_positions = np.where(bos_mask)[0].tolist()
 
     if not bos_positions:
         # No BOS found, treat entire stream as one document
         return [tokens]
 
     documents = []
+    num_tokens = len(tokens)
+
+    # Pre-allocate list for speed
+    documents = []
 
     for i in range(len(bos_positions)):
         start = bos_positions[i]
-        end = bos_positions[i + 1] if i + 1 < len(bos_positions) else len(tokens)
+        end = bos_positions[i + 1] if i + 1 < len(bos_positions) else num_tokens
 
-        doc = tokens[start:end]
-
-        # Skip very short documents (< 10 tokens)
-        if len(doc) >= 10:
-            documents.append(doc)
+        # Skip very short documents (< 10 tokens) without creating tensor
+        if end - start >= 10:
+            documents.append(tokens[start:end])
 
     return documents
 
@@ -194,23 +198,34 @@ def create_filtered_dataset(
     # Process all files and extract filtered documents
     all_filtered_tokens = []
     current_shard_tokens = []
+    current_shard_size = 0  # Track size without recomputing
     shard_idx = 0
     doc_idx = 0
     total_docs_kept = 0
     total_docs_seen = 0
+    total_tokens_processed = 0
 
-    for file_path in tqdm(files, desc="Processing files"):
+    print(f"\nProcessing {len(files)} files with ~{len(keep_indices):,} documents to keep...")
+
+    for file_idx, file_path in enumerate(files):
+        print(f"\n[File {file_idx+1}/{len(files)}] Loading {Path(file_path).name}...")
         tokens = _load_data_shard(Path(file_path))
+        total_tokens_processed += len(tokens)
+
+        print(f"  Extracting documents from {len(tokens):,} tokens...")
         documents = extract_documents(tokens)
 
-        for doc in documents:
+        print(f"  Processing {len(documents):,} documents...")
+
+        # Use tqdm for document-level progress within each file
+        for doc in tqdm(documents, desc=f"  File {file_idx+1}/{len(files)}", leave=False):
             if doc_idx in keep_indices:
                 current_shard_tokens.append(doc)
+                current_shard_size += len(doc)
                 total_docs_kept += 1
 
                 # Check if current shard is large enough
-                current_size = sum(len(t) for t in current_shard_tokens)
-                if current_size >= tokens_per_shard:
+                if current_shard_size >= tokens_per_shard:
                     # Write current shard
                     shard_tokens = torch.cat(current_shard_tokens)
                     output_file = output_path / f"{base_name}_{shard_idx:06d}.bin"
@@ -218,9 +233,14 @@ def create_filtered_dataset(
 
                     shard_idx += 1
                     current_shard_tokens = []
+                    current_shard_size = 0
 
             doc_idx += 1
             total_docs_seen += 1
+
+        # Print file completion stats
+        kept_pct = (total_docs_kept / total_docs_seen * 100) if total_docs_seen > 0 else 0
+        print(f"  ✓ File complete: kept {total_docs_kept:,}/{total_docs_seen:,} docs ({kept_pct:.1f}%), {total_tokens_processed:,} tokens processed")
 
     # Write remaining tokens as final shard
     if current_shard_tokens:
@@ -234,6 +254,7 @@ def create_filtered_dataset(
     print(f"{'='*60}")
     print(f"Total documents seen: {total_docs_seen:,}")
     print(f"Documents kept: {total_docs_kept:,} ({total_docs_kept/total_docs_seen*100:.1f}%)")
+    print(f"Total tokens processed: {total_tokens_processed:,}")
     print(f"Output shards: {shard_idx}")
     print(f"Output directory: {output_dir}")
     print(f"{'='*60}")
