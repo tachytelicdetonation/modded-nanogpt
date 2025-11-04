@@ -230,38 +230,8 @@ echo "Training on 100M raw tokens for ${BASELINE_STEPS} steps..."
 echo "Expected time: ~10 minutes"
 echo ""
 
-# Create temporary training script for baseline
-cat > /tmp/train_baseline.py << 'EOF'
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# We need to modify the hyperparameters before the main script runs
-def modify_config():
-    import train_gpt_single as tgs
-    tgs.args.train_files = "data/fineweb10B/fineweb_train_*.bin"
-    tgs.args.num_scheduled_iterations = BASELINE_STEPS_PLACEHOLDER
-    tgs.args.num_extension_iterations = 0
-    tgs.args.val_loss_every = 100
-    tgs.args.save_checkpoint = False
-    tgs.args.run_id = "baseline_raw"
-
-    # Update file path with DATA_PATH
-    data_path = os.environ.get("DATA_PATH", ".")
-    tgs.args.train_files = os.path.join(data_path, tgs.args.train_files)
-
-modify_config()
-
-# Now run the main training
-exec(open("train_gpt_single.py").read())
-EOF
-
-# Replace placeholder
-sed -i.bak "s/BASELINE_STEPS_PLACEHOLDER/${BASELINE_STEPS}/g" /tmp/train_baseline.py
-rm -f /tmp/train_baseline.py.bak
-
 echo "Running baseline training..."
-python /tmp/train_baseline.py 2>&1 | tee "${BASELINE_LOG}"
+python train_validation_baseline.py 2>&1 | tee "${BASELINE_LOG}"
 
 # Extract final validation loss
 BASELINE_VAL_LOSS=$(grep "val_loss:" "${BASELINE_LOG}" | tail -1 | grep -oP 'val_loss:\s*\K[0-9.]+' || echo "N/A")
@@ -284,38 +254,8 @@ echo "Training on 80M filtered tokens for ${FILTERED_STEPS} steps..."
 echo "Expected time: ~8 minutes"
 echo ""
 
-# Create temporary training script for filtered
-cat > /tmp/train_filtered.py << 'EOF'
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-def modify_config():
-    import train_gpt_single as tgs
-    tgs.args.train_files = "OUTPUT_DIR_PLACEHOLDER/fineweb_train_*.bin"
-    tgs.args.num_scheduled_iterations = FILTERED_STEPS_PLACEHOLDER
-    tgs.args.num_extension_iterations = 0
-    tgs.args.val_loss_every = 100
-    tgs.args.save_checkpoint = False
-    tgs.args.run_id = "filtered_80pct"
-
-    # Update file path with DATA_PATH
-    data_path = os.environ.get("DATA_PATH", ".")
-    tgs.args.train_files = os.path.join(data_path, tgs.args.train_files)
-
-modify_config()
-
-# Now run the main training
-exec(open("train_gpt_single.py").read())
-EOF
-
-# Replace placeholders
-sed -i.bak "s|OUTPUT_DIR_PLACEHOLDER|${OUTPUT_DIR}|g" /tmp/train_filtered.py
-sed -i.bak "s/FILTERED_STEPS_PLACEHOLDER/${FILTERED_STEPS}/g" /tmp/train_filtered.py
-rm -f /tmp/train_filtered.py.bak
-
 echo "Running filtered training..."
-python /tmp/train_filtered.py 2>&1 | tee "${FILTERED_LOG}"
+FILTERED_DATA_DIR="${OUTPUT_DIR}" python train_validation_filtered.py 2>&1 | tee "${FILTERED_LOG}"
 
 # Extract final validation loss
 FILTERED_VAL_LOSS=$(grep "val_loss:" "${FILTERED_LOG}" | tail -1 | grep -oP 'val_loss:\s*\K[0-9.]+' || echo "N/A")
@@ -420,8 +360,5 @@ echo "  - Filtered log:  ${FILTERED_LOG}"
 echo ""
 echo "For detailed guide, see: local_reference/ENTROPY_FILTERING_GUIDE.md"
 echo ""
-
-# Cleanup temporary files
-rm -f /tmp/train_baseline.py /tmp/train_filtered.py
 
 exit 0
