@@ -1087,7 +1087,7 @@ class Hyperparameters:
     # CONFIGURABLE: Adjust batch size for single H100 (80GB memory)
     # Default: 262144 tokens (2048 * 16 * 8) matches distributed version
     # Can increase up to ~2M tokens depending on sequence length and memory requirements
-    train_batch_size: int = 2048 * 16 * 8  # Total tokens per batch
+    train_batch_size: int = 2048 * 16 * 12  # Total tokens per batch (increased to ~67GB memory)
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
