@@ -174,16 +174,18 @@ def simple_data_loader(filename_pattern: str, num_tokens: int, seq_len: int, bat
     print(f"Total tokens loaded: {len(all_tokens):,}")
 
     # Create batches
-    num_batches = (len(all_tokens) - 1) // (batch_size * seq_len)
+    # Each batch needs batch_size * (seq_len + 1) tokens
+    tokens_per_batch = batch_size * (seq_len + 1)
+    num_batches = len(all_tokens) // tokens_per_batch
     print(f"Total batches: {num_batches}")
 
     # Trim to fit exact number of batches
-    total_length = num_batches * batch_size * seq_len
-    all_tokens = all_tokens[:total_length + 1]
+    total_length = num_batches * tokens_per_batch
+    all_tokens = all_tokens[:total_length]
 
     for i in range(num_batches):
-        start = i * batch_size * seq_len
-        end = start + batch_size * seq_len + 1
+        start = i * tokens_per_batch
+        end = start + tokens_per_batch
 
         batch_tokens = all_tokens[start:end]
 
