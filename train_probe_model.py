@@ -192,8 +192,8 @@ def simple_data_loader(filename_pattern: str, num_tokens: int, seq_len: int, bat
         # Reshape to [batch_size, seq_len + 1]
         batch_tokens = batch_tokens.view(batch_size, seq_len + 1)
 
-        input_ids = batch_tokens[:, :-1]
-        targets = batch_tokens[:, 1:]
+        input_ids = batch_tokens[:, :-1].long()  # Convert uint16 -> int64 for embedding
+        targets = batch_tokens[:, 1:].long()    # Convert uint16 -> int64 for cross_entropy
 
         yield input_ids, targets
 
