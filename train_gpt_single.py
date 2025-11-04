@@ -22,15 +22,10 @@ torch.empty(
 import torch._dynamo as dynamo
 import torch.nn.functional as F
 
-# Enable TF32 for H100 optimization (using new API for PyTorch 2.9+)
-try:
-    # New API (PyTorch 2.9+)
-    torch.backends.cudnn.conv.fp32_precision = 'tf32'
-    torch.backends.cuda.matmul.fp32_precision = 'tf32'
-except AttributeError:
-    # Fallback to old API for older PyTorch versions
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+# Enable TF32 for H100 optimization using old API
+# Note: Using only old API to avoid conflicts with PyTorch 2.9+ internals
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 import triton
