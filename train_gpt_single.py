@@ -33,6 +33,23 @@ import triton.language as tl
 from kernels import get_kernel
 from torch import Tensor, nn
 
+# Weights & Biases for experiment tracking
+try:
+    import wandb
+    WANDB_AVAILABLE = not os.environ.get("WANDB_DISABLED", False)
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not installed. Install with 'pip install wandb' for experiment tracking.")
+
+# Spiking Neural Network support
+try:
+    from spikingjelly.clock_driven.neuron import MultiStepLIFNode
+    SPIKING_AVAILABLE = True
+except ImportError:
+    SPIKING_AVAILABLE = False
+    MultiStepLIFNode = None
+    print("Warning: spikingjelly not installed. Install with 'pip install spikingjelly==0.0.0.0.12' for SNN support.")
+
 # Handle both old and new PyTorch versions (recompile_limit was renamed from cache_size_limit)
 try:
     dynamo.config.recompile_limit = 64
@@ -768,13 +785,112 @@ class MLP(nn.Module):
         x = F.linear(x, self.c_proj.type_as(x))
         return x
 
+
+class SpikingMLP(nn.Module):
+    """
+    Spiking Neural Network MLP adapted from MaxFormer's S_MLP.
+    Uses LIF (Leaky Integrate-and-Fire) neurons for event-driven computation.
+
+    Adapted for 1D language sequences:
+    - Input shape: (T, B, N, C) where T=time_steps, B=batch, N=seq_len, C=channels
+    - Uses Linear layers instead of Conv2d for language modeling
+    - Membrane-level residual connections (before spiking)
+    - Supports adaptive time steps (T=4 training, T=1 inference)
+    """
+    def __init__(self, dim: int, time_steps: int = 4):
+        super().__init__()
+        hdim = 4 * dim
+        self.dim = dim
+        self.hdim = hdim
+        self.time_steps = time_steps
+
+        # First layer: Linear -> BatchNorm -> LIF
+        self.fc1 = nn.Linear(dim, hdim, bias=False)
+        self.bn1 = nn.BatchNorm1d(hdim)
+        if SPIKING_AVAILABLE:
+            self.lif1 = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
+        else:
+            self.lif1 = None
+
+        # Second layer: Linear -> BatchNorm -> LIF
+        self.fc2 = nn.Linear(hdim, dim, bias=False)
+        self.bn2 = nn.BatchNorm1d(dim)
+        if SPIKING_AVAILABLE:
+            self.lif2 = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
+        else:
+            self.lif2 = None
+
+        # Initialize weights similar to standard MLP
+        std = 0.5 * (dim ** -0.5)
+        bound = (3 ** 0.5) * std
+        with torch.no_grad():
+            self.fc1.weight.uniform_(-bound, bound)
+            self.fc2.weight.zero_()  # zero init for second layer
+
+    def forward(self, x: Tensor):
+        """
+        Forward pass with temporal dynamics.
+        Input: (B, N, C) - standard batch format
+        Output: (B, N, C) - same format
+
+        Internally processes with time dimension (T, B, N, C)
+        """
+        if not SPIKING_AVAILABLE or self.lif1 is None:
+            # Fallback to standard MLP if spikingjelly not available
+            x = self.fc1(x)
+            x = F.relu(x).square()
+            x = self.fc2(x)
+            return x
+
+        B, N, C = x.shape
+        T = self.time_steps if self.training else 1  # Adaptive: T=4 train, T=1 inference
+
+        # Add time dimension: (B, N, C) -> (T, B, N, C)
+        # Replicate input across time steps for initial membrane potential
+        x = x.unsqueeze(0).expand(T, -1, -1, -1)
+        identity = x
+
+        # First layer with membrane shortcut
+        if self.lif1 is not None:
+            x = self.lif1(x)  # Spiking activation
+        x = x.reshape(T * B * N, C)
+        x = self.fc1(x)
+        x = self.bn1(x)
+        x = x.reshape(T, B, N, self.hdim)
+        x = x + identity.mean(-1, keepdim=True).expand(-1, -1, -1, self.hdim)  # Membrane shortcut
+
+        identity = x.mean(-1, keepdim=True).expand(-1, -1, -1, C)  # For final residual
+
+        # Second layer with membrane shortcut
+        if self.lif2 is not None:
+            x = self.lif2(x)  # Spiking activation
+        x = x.reshape(T * B * N, self.hdim)
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = x.reshape(T, B, N, C)
+
+        # Final membrane-level residual
+        x = x + identity
+
+        # Aggregate over time dimension: (T, B, N, C) -> (B, N, C)
+        # Use mean pooling across time steps
+        x = x.mean(dim=0)
+
+        return x
+
 class Block(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, use_spiking_mlp: bool = False, time_steps: int = 4):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx not in [0, 7] else None
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
-        self.mlp = MLP(dim) if layer_idx != 0 else None
+        if layer_idx != 0:
+            if use_spiking_mlp and SPIKING_AVAILABLE:
+                self.mlp = SpikingMLP(dim, time_steps=time_steps)
+            else:
+                self.mlp = MLP(dim)
+        else:
+            self.mlp = None
 
     def forward(self, x: Tensor, x0: Tensor, lambdas: Tensor, attn_args: AttnArgs):
         x = lambdas[0] * x + lambdas[1] * x0
@@ -791,7 +907,8 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int,
+                 use_spiking_mlp: bool = False, time_steps: int = 4):
         super().__init__()
         vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.embed = nn.Embedding(vocab_size, model_dim)
@@ -802,7 +919,7 @@ class GPT(nn.Module):
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i, use_spiking_mlp=use_spiking_mlp, time_steps=time_steps) for i in range(num_layers)])
         self.yarn = Yarn(head_dim, max_seq_len)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
@@ -1087,7 +1204,7 @@ class Hyperparameters:
     # CONFIGURABLE: Adjust batch size for single H100 (80GB memory)
     # Default: 262144 tokens (2048 * 16 * 8) matches distributed version
     # Can increase up to ~2M tokens depending on sequence length and memory requirements
-    train_batch_size: int = 2048 * 16 * 12  # Total tokens per batch (increased to ~67GB memory)
+    train_batch_size: int = 2048 * 16 * 8  # Total tokens per batch (increased to ~67GB memory)
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
@@ -1104,6 +1221,9 @@ class Hyperparameters:
     ws_schedule: tuple = (3, 7, 11)
     ws_validate: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
+    # spiking neural network options
+    use_spiking_mlp: bool = False  # Replace standard MLP with Spiking MLP (requires spikingjelly)
+    snn_time_steps: int = 4  # Number of time steps for SNN (T=4 training, T=1 inference)
 
 args = Hyperparameters()
 
@@ -1121,6 +1241,70 @@ assert torch.cuda.is_available()
 device = torch.device("cuda:0")  # Explicitly specify device index 0
 torch.cuda.set_device(device)
 master_process = True  # Single GPU is always the master process
+
+# Initialize Weights & Biases
+def init_wandb():
+    """Initialize Weights & Biases experiment tracking"""
+    if not WANDB_AVAILABLE:
+        return None
+
+    try:
+        # Convert hyperparameters to dict for W&B
+        config = {
+            "train_files": args.train_files,
+            "val_files": args.val_files,
+            "val_tokens": args.val_tokens,
+            "train_batch_size": args.train_batch_size,
+            "train_max_seq_len": args.train_max_seq_len,
+            "val_batch_size": args.val_batch_size,
+            "num_iterations": args.num_iterations,
+            "num_scheduled_iterations": args.num_scheduled_iterations,
+            "num_extension_iterations": args.num_extension_iterations,
+            "cooldown_frac": args.cooldown_frac,
+            "val_loss_every": args.val_loss_every,
+            "block_size": args.block_size,
+            "ws_schedule": args.ws_schedule,
+            "ws_validate": args.ws_validate,
+            "ws_validate_post_yarn_ext": args.ws_validate_post_yarn_ext,
+            "grad_accum_steps": grad_accum_steps,
+            "device": str(device),
+            "world_size": world_size,
+            # Model architecture
+            "vocab_size": 50257,
+            "num_layers": 12,
+            "num_heads": 6,
+            "head_dim": 128,
+            "model_dim": 768,
+            # Software versions
+            "python_version": sys.version.split()[0],
+            "pytorch_version": torch.version.__version__,
+            "cuda_version": torch.version.cuda,
+            "triton_version": triton.__version__,
+        }
+
+        wandb.init(
+            project="modded-nanogpt",
+            config=config,
+            name=args.run_id,
+            id=args.run_id,
+            resume="allow"
+        )
+
+        # Log GPU information
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
+            wandb.config.update({
+                "gpu_name": gpu_name,
+                "gpu_memory_gb": gpu_memory,
+            })
+
+        return wandb
+    except Exception as e:
+        print(f"Warning: Failed to initialize wandb: {e}")
+        return None
+
+wandb_run = init_wandb()
 
 # begin logging
 logfile = None
@@ -1156,11 +1340,27 @@ model: nn.Module = GPT(
     num_heads=6,
     head_dim=128,
     model_dim=768,
-    max_seq_len=max(args.train_batch_size, args.val_batch_size) // grad_accum_steps
+    max_seq_len=max(args.train_batch_size, args.val_batch_size) // grad_accum_steps,
+    use_spiking_mlp=args.use_spiking_mlp,
+    time_steps=args.snn_time_steps
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
         m.bfloat16()
+
+# Log model information to W&B
+if wandb_run is not None:
+    try:
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        wandb.config.update({
+            "total_parameters": total_params,
+            "trainable_parameters": trainable_params,
+            "parameters_millions": total_params / 1e6,
+        })
+        print0(f"Model parameters: {total_params:,} ({total_params/1e6:.2f}M)")
+    except Exception as e:
+        print0(f"Warning: Failed to log model info to wandb: {e}")
 
 # collect the parameters to optimize
 hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n and "gate" not in n]
@@ -1311,6 +1511,19 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+
+        # Log validation metrics to W&B
+        if wandb_run is not None:
+            try:
+                wandb.log({
+                    "val/loss": val_loss.item() if torch.is_tensor(val_loss) else val_loss,
+                    "val/step": step,
+                    "train/time_ms": training_time_ms,
+                    "train/step_avg_ms": training_time_ms / max(step, 1),
+                }, step=step)
+            except Exception as e:
+                print0(f"Warning: Failed to log validation metrics to wandb: {e}")
+
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -1320,7 +1533,27 @@ for step in range(train_steps + 1):
         if master_process and args.save_checkpoint:
             log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
             os.makedirs(f"logs/{run_id}", exist_ok=True)
-            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            checkpoint_path = f"logs/{run_id}/state_step{step:06d}.pt"
+            torch.save(log, checkpoint_path)
+
+            # Log checkpoint to W&B as artifact
+            if wandb_run is not None:
+                try:
+                    artifact = wandb.Artifact(
+                        name=f"model-checkpoint-step-{step}",
+                        type="model",
+                        description=f"Model checkpoint at step {step}",
+                        metadata={
+                            "step": step,
+                            "val_loss": val_loss.item() if torch.is_tensor(val_loss) else val_loss,
+                        }
+                    )
+                    artifact.add_file(checkpoint_path)
+                    wandb.log_artifact(artifact)
+                    print0(f"Checkpoint logged to W&B as artifact")
+                except Exception as e:
+                    print0(f"Warning: Failed to log checkpoint to wandb: {e}")
+
         # the last step only has the validation loop, so break to avoid training
         break
 
@@ -1334,5 +1567,45 @@ for step in range(train_steps + 1):
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
-print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-       f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+    # Log training metrics to W&B
+    if wandb_run is not None:
+        try:
+            # Get current learning rate and momentum
+            current_lr = optimizers[0].param_groups[0]["lr"]
+            current_momentum = optimizers[1].param_groups[0]["momentum"]
+
+            # Get GPU memory usage
+            memory_allocated = torch.cuda.memory_allocated() / 1024**2  # MB
+            memory_reserved = torch.cuda.memory_reserved() / 1024**2  # MB
+
+            wandb.log({
+                "train/step": step + 1,
+                "train/learning_rate": current_lr,
+                "train/momentum": current_momentum,
+                "train/ws_short": ws_short,
+                "train/ws_long": ws_long,
+                "train/time_ms": approx_training_time_ms,
+                "train/step_avg_ms": approx_training_time_ms / (step + 1),
+                "system/memory_allocated_mb": memory_allocated,
+                "system/memory_reserved_mb": memory_reserved,
+                "system/memory_utilization_pct": (memory_allocated / memory_reserved * 100) if memory_reserved > 0 else 0,
+            }, step=step + 1)
+        except Exception as e:
+            print0(f"Warning: Failed to log training metrics to wandb: {e}")
+
+peak_memory_allocated = torch.cuda.max_memory_allocated() // 1024 // 1024
+peak_memory_reserved = torch.cuda.max_memory_reserved() // 1024 // 1024
+print0(f"peak memory allocated: {peak_memory_allocated} MiB "
+       f"reserved: {peak_memory_reserved} MiB", console=True)
+
+# Log final summary to W&B
+if wandb_run is not None:
+    try:
+        wandb.log({
+            "system/peak_memory_allocated_mb": peak_memory_allocated,
+            "system/peak_memory_reserved_mb": peak_memory_reserved,
+        })
+        wandb.finish()
+        print0("W&B run finished successfully", console=True)
+    except Exception as e:
+        print0(f"Warning: Failed to finish wandb run: {e}")
